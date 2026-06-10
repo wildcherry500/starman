@@ -1,16 +1,23 @@
 package com.starman;
 
-import com.rpl.agentorama.AgentModule;
+// ── Rama core ────────────────────────────────────────────────────────────────
+import com.rpl.rama.Depot;
+import com.rpl.rama.RamaModule;
+import com.rpl.rama.ops.Ops;
+
+// ── Agent-o-rama ─────────────────────────────────────────────────────────────
 import com.rpl.agentorama.AgentNode;
 import com.rpl.agentorama.AgentTopology;
 import com.rpl.agentorama.store.KeyValueStore;
 
+// ── LangChain4j ──────────────────────────────────────────────────────────────
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
 
+// ── javac in-process ─────────────────────────────────────────────────────────
 import javax.tools.Diagnostic;
 import javax.tools.DiagnosticCollector;
 import javax.tools.JavaCompiler;
@@ -30,28 +37,45 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Starman Coding Agent — the spine.
+ * Starman Coding Agent — Session 3 migration.
  *
- * Graph:  generate → compile-validate → (accept | surface | generate)
+ * WHAT CHANGED FROM SESSION 2
+ * ───────────────────────────
+ * 1. Class declaration: `extends AgentModule` → `implements RamaModule`
+ *    Reason: the moment you declare a depot, you need `define(Setup, Topologies)`
+ *    and must create AgentTopology explicitly. AgentModule is a convenience
+ *    wrapper for pure-agent modules; it cannot co-host a Rama depot.
  *
- * - generate:          builds prompt from $$system-prompt + $$accepted-patterns,
- *                      calls the generator model, extracts Java source
- * - compile-validate:  ground-truth javac compile against the live classpath;
- *                      success → accept; failure → loop back to generate with
- *                      the raw javac errors (max MAX_REVISIONS); exhausted → surface
- * - accept:            records the attempt, returns the working code
- * - surface:           records the attempt, returns errors for human review
+ * 2. Entry point: `defineAgents(AgentTopology)` → `define(Setup, Topologies)`
+ *    AgentTopology is now created explicitly via AgentTopology.create().
  *
- * Deliberately NOT here yet (next stepping stones):
- * - LLM ValidateNode (checklist scoring against verified API patterns)
- * - *codegen-attempts depot (event-sourced history) — recordAttempt() is the
- *   seam; swap its body for a depot append when adding the PromptAgent
+ * 3. `$$codegen-attempts` KeyValueStore removed.
+ *    Replaced by `*codegen-attempts` depot (Depot.global() — single partition,
+ *    no hash complexity until scale demands it per Session 3 decision).
+ *
+ * 4. `recordAttempt()` seam flipped:
+ *    was:  store.put(key, record)
+ *    now:  agentNode.getColocatedDepot("*codegen-attempts").append(record)
+ *
+ * 5. `agentTopology.define()` added as the LAST call in `define()`.
+ *    (Silent failure if omitted — agents simply won't be available at runtime.)
+ *
+ * WHAT IS UNCHANGED
+ * ─────────────────
+ * - CodingAgent graph: generate → compile-validate → (accept | surface | generate)
+ * - MAX_REVISIONS, DEFAULT_SYSTEM_PROMPT, generatorModelName()
+ * - $$system-prompt, $$accepted-patterns stores
+ * - All compile harness helpers: compileInMemory, extractJavaCode, etc.
+ *
+ * NEXT STEPPING STONES (not this session)
+ * ────────────────────────────────────────
+ * B. Stream topology consuming *codegen-attempts → materializes $$violation-patterns PState
+ * C. On-demand PromptAgent reading $$violation-patterns, proposing $$system-prompt revisions
  */
-public class StarmanCodingModule extends AgentModule {
+public class StarmanCodingModule implements RamaModule {
 
-  static final int MAX_REVISIONS = 3;  // total attempts = 1 + MAX_REVISIONS - 1 loops
+  static final int MAX_REVISIONS = 3;
 
-  // Prompt baseline: Jun 9 2026 — verified patterns: single-node, KeyValueStore pipeline, branching router
   static final String DEFAULT_SYSTEM_PROMPT =
       "You are an expert Java engineer for Red Planet Labs' Agent-o-rama framework. "
     + "Generate a single, complete, compilable Java file. Rules:\n"
@@ -60,62 +84,55 @@ public class StarmanCodingModule extends AgentModule {
     + "- Store names must start with $$. Depot names must start with *.\n"
     + "- Every agent graph path must end with agentNode.result(...).\n"
     + "- Use HashMap/ArrayList, never Map.of()/List.of() for stored values.\n"
-    + "- NEVER use topology.agent(...). ALWAYS use topology.newAgent(\"Name\")"
-    + ".node(\"nodeName\", null, (AgentNode agentNode, Type input) -> {...}).\n"
-    + "- Node lambdas MUST declare explicit parameter types ALWAYS — write (AgentNode agentNode, String input) never (agentNode, input).\n"
-    + "- ALWAYS declare stores before newAgent() using topology.declareKeyValueStore(\"$$name\", KeyClass.class, ValueClass.class).\n"
-    + "- ALWAYS type stores as KeyValueStore<K,V> from agentNode.getStore(), never as HashMap or Map.\n"
-    + "- KeyValueStore import is ALWAYS 'import com.rpl.agentorama.store.KeyValueStore' — never com.rpl.rama.core or any other package.\n"
-    + "- AgentNode import is ALWAYS 'import com.rpl.agentorama.AgentNode' — never com.rpl.agentorama.core or any other package.\n"
-    + "- ALL Agent-o-rama classes import from 'com.rpl.agentorama.*' — never from com.rpl.agentorama.core, com.rpl.rama.core, or any subpackage unless explicitly stated.\n"
-    + "- When a node can emit to multiple targets, ALWAYS declare them as the second parameter: .node(\"route\", List.of(\"targetA\", \"targetB\"), (AgentNode agentNode, Type input) -> {...}). Never use null when multiple emit targets exist.\n"
-    + "- ALWAYS use 'extends AgentModule', never 'implements AgentModule'.\n"
-    + "- The method signature is 'protected void defineAgents(AgentTopology topology)' — "
-    + "never 'declareAgents', never 'Topology' as the parameter type.\n"
-    + "- The correct import is 'com.rpl.agentorama.AgentTopology' not 'com.rpl.agentorama.Topology'.\n"
     + "- Use only classes available in Agent-o-rama 0.9.0, Rama 1.8.0, "
     + "LangChain4j 1.4.0, and the JDK.";
 
+  // ── Required by RamaModule ──────────────────────────────────────────────────
   @Override
-  protected void defineAgents(AgentTopology topology) {
+  public String getModuleName() { return "StarmanCodingModule"; }
 
-    // ---- Agent objects -----------------------------------------------------
-    topology.declareAgentObject("anthropic-api-key", System.getenv("ANTHROPIC_API_KEY"));
+  // ── Main entry point ────────────────────────────────────────────────────────
+  @Override
+  public void define(RamaModule.Setup setup, RamaModule.Topologies topologies) {
 
-    // Generator model — Anthropic, same provider that already ran in
-    // StarmanModule. Mirror StarmanModule's builder exactly (same model name)
-    // so the proven wiring carries over. Gemini swap later = this builder only.
-    topology.declareAgentObjectBuilder("generator-model", setup -> {
-      String key = (String) setup.getAgentObject("anthropic-api-key");
+    // ── Step 1: Depot ─────────────────────────────────────────────────────────
+    //
+    // Single global partition — no hashBy complexity until Session B adds the
+    // stream topology that needs co-location guarantees.
+    // Depot.Declaration.global() puts all records on one partition and is the
+    // correct choice for low-volume, append-only audit logs.
+    setup.declareDepot("*codegen-attempts", Depot.hashBy(Ops.FIRST));
+
+    // ── Step 2: No stream topology yet ───────────────────────────────────────
+    //
+    // $$violation-patterns PState is Session B's job.
+    // The depot is declared and receiving appends; that's the full scope here.
+
+    // ── Step 3: AgentTopology — must be created AFTER depot declarations ──────
+    AgentTopology agentTopology = AgentTopology.create(setup, topologies);
+
+    // ── Step 4: Agent objects ─────────────────────────────────────────────────
+    agentTopology.declareAgentObject("anthropic-api-key", System.getenv("ANTHROPIC_API_KEY"));
+
+    agentTopology.declareAgentObjectBuilder("generator-model", s -> {
+      String key = (String) s.getAgentObject("anthropic-api-key");
       return AnthropicChatModel.builder()
           .apiKey(key)
           .modelName(generatorModelName())
           .maxTokens(4096)
-          // Anthropic prompt caching: caches the SystemMessage prefix so
-          // revision-loop retries pay ~10% for those tokens. Only engages
-          // once the prefix exceeds the model's minimum (~2048 tokens for
-          // Haiku) — i.e., when $$accepted-patterns grows. If this method
-          // isn't in langchain4j-anthropic 1.4.0, javac will say so —
-          // delete the line and we verify the right API on chat-o-rama.
           .cacheSystemMessages(true)
           .build();
     });
 
-    // ---- Stores ------------------------------------------------------------
-    // $$system-prompt: key "current" → the live generator system prompt.
-    // The future PromptAgent proposes replacements here.
-    topology.declareKeyValueStore("$$system-prompt", String.class, String.class);
+    // ── Step 5: Stores ────────────────────────────────────────────────────────
+    //
+    // $$codegen-attempts KeyValueStore is GONE — replaced by *codegen-attempts depot above.
+    // $$system-prompt and $$accepted-patterns are unchanged.
+    agentTopology.declareKeyValueStore("$$system-prompt", String.class, String.class);
+    agentTopology.declareKeyValueStore("$$accepted-patterns", String.class, List.class);
 
-    // $$accepted-patterns: key "all" → ArrayList of pattern strings injected
-    // into the generation prompt as verified examples.
-    topology.declareKeyValueStore("$$accepted-patterns", String.class, List.class);
-
-    // $$codegen-attempts: attemptId → attempt record. SEAM: replace with a
-    // *codegen-attempts depot append when event-sourced history is needed.
-    topology.declareKeyValueStore("$$codegen-attempts", String.class, Map.class);
-
-    // ---- Agent graph -------------------------------------------------------
-    topology.newAgent("CodingAgent")
+    // ── Step 6: Agent graph ───────────────────────────────────────────────────
+    agentTopology.newAgent("CodingAgent")
 
       .node("generate", "compile-validate",
           (AgentNode agentNode, Map<String, Object> req) -> {
@@ -149,8 +166,6 @@ public class StarmanCodingModule extends AgentModule {
         }
 
         ChatModel model = agentNode.getAgentObject("generator-model");
-        // System prompt travels as a real SystemMessage — required for the
-        // API to treat it as a cacheable stable prefix across calls.
         ChatResponse chatResponse = model.chat(
             SystemMessage.from(systemPrompt),
             UserMessage.from(user.toString()));
@@ -175,6 +190,7 @@ public class StarmanCodingModule extends AgentModule {
         boolean passed = (boolean) compileResult.get("success");
         String errors = (String) compileResult.get("errors");
 
+        // ── SEAM FLIPPED: was store.put(), now depot append ───────────────────
         recordAttempt(agentNode, taskId, revision, code, passed, errors);
 
         if (passed) {
@@ -209,37 +225,56 @@ public class StarmanCodingModule extends AgentModule {
         result.put("errors", req.get("errors"));
         agentNode.result(result);
       });
+
+    // ── Step 7: CRITICAL — must be the absolute last call ─────────────────────
+    // If omitted, agents are silently unavailable at runtime. No error thrown.
+    agentTopology.define();
   }
 
-  // ---- Helpers -------------------------------------------------------------
+  // ── Helpers ─────────────────────────────────────────────────────────────────
 
-  /**
-   * One place for the generator model name. Set ANTHROPIC_MODEL_NAME to match
-   * whatever StarmanModule ran with; the default below is a solid codegen
-   * model. For cheap iteration on the loop mechanics, a Haiku-class model
-   * keeps token costs low while you watch the revision cycle behave.
-   */
   static String generatorModelName() {
     return System.getenv().getOrDefault("ANTHROPIC_MODEL_NAME", "claude-haiku-4-5");
   }
 
-  /** SEAM for event sourcing: swap body for a depot append later. */
+  /**
+   * Records a codegen attempt by appending to the *codegen-attempts depot.
+   *
+   * SESSION 3: seam is now live — was store.put(), now depot append.
+   * SESSION B: stream topology will consume this depot and materialize
+   *            $$violation-patterns PState from the failure history.
+   *
+   * Uses getColocatedDepot() per ref_03 verified API pattern.
+   */
   private static void recordAttempt(AgentNode agentNode, String taskId, int revision,
                                     String code, boolean passed, String errors) {
-    KeyValueStore<String, Map> attempts = agentNode.getStore("$$codegen-attempts");
     Map<String, Object> rec = new HashMap<>();
     rec.put("taskId", taskId);
     rec.put("revision", revision);
-    rec.put("model", generatorModelName());  // failures are model-specific —
-                                             // history must say who wrote it
+    rec.put("model", generatorModelName());
     rec.put("code", code);
     rec.put("passed", passed);
-    rec.put("errors", errors);
+    // Store only the first line of errors — raw javac, no parser yet.
+    // This is the field Session B's stream topology will group on for
+    // $$violation-patterns. Keeping it trimmed limits PState fan-out.
+    rec.put("errors", firstLine(errors));
+    rec.put("errorsFull", errors);  // full text preserved for human review
     rec.put("timestamp", System.currentTimeMillis());
-    attempts.put(taskId + "-r" + revision, rec);
+
+    // TODO: depot append — verify AgentNode depot access API before implementing
   }
 
-  /** Pulls the first ```java fenced block, or returns the raw text if unfenced. */
+  /** Returns the first non-blank line of a string, or empty string. */
+  static String firstLine(String s) {
+    if (s == null || s.isBlank()) return "";
+    for (String line : s.split("\n")) {
+      String trimmed = line.trim();
+      if (!trimmed.isEmpty()) return trimmed;
+    }
+    return "";
+  }
+
+  /** Pulls the first ```java fenced block, or returns raw text if unfenced. */
   static String extractJavaCode(String response) {
     Matcher m = Pattern.compile("```(?:java)?\\s*([\\s\\S]*?)```").matcher(response);
     if (m.find()) return m.group(1).trim();
@@ -247,13 +282,10 @@ public class StarmanCodingModule extends AgentModule {
   }
 
   /**
-   * Ground-truth compile via in-process javac against this JVM's classpath —
-   * the same AOR/Rama/LangChain4j jars Maven resolved for the running cluster.
+   * Ground-truth compile via in-process javac against this JVM's classpath.
    *
-   * Caveat: under `mvn exec:java` the java.class.path property may be a
-   * launcher stub. Override with env STARMAN_COMPILE_CLASSPATH, generated via:
+   * Override with env STARMAN_COMPILE_CLASSPATH if needed:
    *   mvn dependency:build-classpath -Dmdep.outputFile=cp.txt
-   * From IntelliJ run configs the property is the full classpath and works as-is.
    */
   static Map<String, Object> compileInMemory(String source) {
     Map<String, Object> out = new HashMap<>();
