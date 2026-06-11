@@ -20,3 +20,4 @@ Last updated: Jun 10 2026 — verified by jar inspection
 - Node lambdas require explicit types: `(AgentNode agentNode, String input)` never `(agentNode, input)`
 - KeyValueStore import: `import com.rpl.agentorama.store.KeyValueStore;`
 - Store declaration before agent: `topology.declareKeyValueStore("$$name", KeyClass.class, ValueClass.class)`
+- Depot access from AgentNode: use agentNode.getDepot("*name").append(record) — NOT getColocatedDepot() which does not exist in AOR 0.9.0 (ref_03 was captured against v0.7.0 and is wrong on this point)
