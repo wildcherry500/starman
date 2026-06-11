@@ -21,3 +21,7 @@ Last updated: Jun 10 2026 — verified by jar inspection
 - KeyValueStore import: `import com.rpl.agentorama.store.KeyValueStore;`
 - Store declaration before agent: `topology.declareKeyValueStore("$$name", KeyClass.class, ValueClass.class)`
 - Depot access from AgentNode: use agentNode.getDepot("*name").append(record) — NOT getColocatedDepot() which does not exist in AOR 0.9.0 (ref_03 was captured against v0.7.0 and is wrong on this point)
+- StreamTopology import: `import com.rpl.rama.module.StreamTopology` not `import com.rpl.rama.StreamTopology`
+- Stream topology filter: `.keepTrue("*varName")` not `.filter("*varName")`
+- Stream topology each() binding: pass the variable name as trailing arg, not chained via .out() before the lambda
+- agentNode.getColocatedPState() does not exist in AOR 0.9.0 — read PState data via req map or a separate query instead

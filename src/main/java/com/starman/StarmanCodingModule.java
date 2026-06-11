@@ -2,7 +2,9 @@ package com.starman;
 
 // ── Rama core ────────────────────────────────────────────────────────────────
 import com.rpl.rama.Depot;
+import com.rpl.rama.PState;
 import com.rpl.rama.RamaModule;
+import com.rpl.rama.module.StreamTopology;
 import com.rpl.rama.ops.Ops;
 
 // ── Agent-o-rama ─────────────────────────────────────────────────────────────
@@ -103,10 +105,30 @@ public class StarmanCodingModule implements RamaModule {
     // correct choice for low-volume, append-only audit logs.
     setup.declareDepot("*codegen-attempts", Depot.hashBy(Ops.FIRST));
 
-    // ── Step 2: No stream topology yet ───────────────────────────────────────
+    // ── Step 2: Stream topology — materialize $$violation-patterns PState ────
     //
-    // $$violation-patterns PState is Session B's job.
-    // The depot is declared and receiving appends; that's the full scope here.
+    // Consumes *codegen-attempts depot. For each failed attempt, extracts the
+    // first line of errors and increments a counter in $$violation-patterns.
+    // Schema: { errorFirstLine<String> : count<Long> }
+    StreamTopology violationStream = topologies.stream("violation-projector");
+
+    violationStream.pstate("$$violation-patterns",
+        PState.mapSchema(String.class, Long.class));
+
+    violationStream.source("*codegen-attempts").out("*attempt")
+        .each((Object attempt) -> {
+            Map<String, Object> rec = (Map<String, Object>) attempt;
+            Boolean passed = (Boolean) rec.get("passed");
+            return passed != null && !passed;
+        }, "*attempt").out("*isFailed")
+        .keepTrue("*isFailed")
+        .each((Object attempt) -> {
+            Map<String, Object> rec = (Map<String, Object>) attempt;
+            String errors = (String) rec.get("errors");
+            return errors == null || errors.isBlank() ? "unknown" : errors;
+        }, "*attempt").out("*errorKey")
+        .localTransform("$$violation-patterns",
+            com.rpl.rama.Path.key("*errorKey").term(count -> count == null ? 1L : (Long) count + 1L));
 
     // ── Step 3: AgentTopology — must be created AFTER depot declarations ──────
     AgentTopology agentTopology = AgentTopology.create(setup, topologies);
@@ -225,6 +247,42 @@ public class StarmanCodingModule implements RamaModule {
         result.put("errors", req.get("errors"));
         agentNode.result(result);
       });
+
+    // ── PromptAgent ───────────────────────────────────────────────────────────
+    //
+    // On-demand agent. Reads $$violation-patterns, calls Haiku, proposes a new
+    // prompt rule. Returns proposal as a String for human review and approval.
+    // Human applies the rule manually via Claude Code.
+    agentTopology.newAgent("PromptAgent")
+
+        .node("analyze", null,
+            (AgentNode agentNode, Map<String, Object> req) -> {
+
+            // Read current system prompt
+            KeyValueStore<String, String> promptStore =
+                agentNode.getStore("$$system-prompt");
+            String currentPrompt = promptStore.get("current");
+            if (currentPrompt == null) currentPrompt = DEFAULT_SYSTEM_PROMPT;
+
+            // Build analysis request for Haiku
+            String analysisPrompt =
+                "You are improving a code generation system prompt.\n\n"
+              + "CURRENT SYSTEM PROMPT:\n" + currentPrompt + "\n\n"
+              + "TOP VIOLATION PATTERNS (error → count):\n"
+              + req.get("violationSummary") + "\n\n"
+              + "Propose ONE new rule (one sentence) to add to the system prompt "
+              + "that would prevent the most frequent violation. "
+              + "Output ONLY the rule text, no explanation, no preamble.";
+
+            ChatModel model = agentNode.getAgentObject("generator-model");
+            String proposed = model.chat(analysisPrompt);
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("proposedRule", proposed.trim());
+            result.put("currentPrompt", currentPrompt);
+            result.put("violationSummary", req.get("violationSummary"));
+            agentNode.result(result);
+        });
 
     // ── Step 7: CRITICAL — must be the absolute last call ─────────────────────
     // If omitted, agents are silently unavailable at runtime. No error thrown.
