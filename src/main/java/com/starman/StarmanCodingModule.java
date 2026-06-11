@@ -261,7 +261,7 @@ public class StarmanCodingModule implements RamaModule {
     rec.put("errorsFull", errors);  // full text preserved for human review
     rec.put("timestamp", System.currentTimeMillis());
 
-    // TODO: depot append — verify AgentNode depot access API before implementing
+    agentNode.getDepot("*codegen-attempts").append(rec);
   }
 
   /** Returns the first non-blank line of a string, or empty string. */
